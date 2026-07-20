@@ -3,10 +3,6 @@ import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
 import { drawCover, replayStroke, createEngines, buildCaptionTrack } from './brush.js';
 import { startHandTracking, stopHandTracking, handCursors, HAND_POINTER_ID } from './hand.js';
 import { initCropTool } from './crop.js';
-import {
-  loadSvgBackground, setLayerVisible, setLayerTransform, rasterizeSvgBackground,
-  serializeSvgBackground, cloneForExport,
-} from './svgbg.js';
 
 const A1 = { w: 594, h: 841 };
 const PREVIEW_W = 1200;
@@ -18,34 +14,9 @@ const TYPO_SRC = {
   ver2: 'assets/posterVisualLanVer2.png',
   ver3: 'assets/posterVisualLanVer3.png',
   ver4: 'assets/posterVisualLanVer4.png',
+  ver5: 'assets/posterVisualLanVer5.png',
+  ver6: 'assets/posterVisualLanVer6.png',
 };
-
-// SVG背景(要素ごとに表示/非表示を切り替えられる版)。
-// svgPhoto=写真+タイポ一式、svgType=タイポのみ(コーナーのJUロゴ付き)
-const SVG_BG_SRC = {
-  svgPhoto: 'assets/posterVisualLanVer2-02.svg',
-  svgType: 'assets/posterVisualLanVer2-03.svg',
-};
-// どのSVGにどのレイヤーが含まれるか(loadSvgBackground前でもUIの出し分けに使う)
-const SVG_LAYER_AVAILABILITY = {
-  svgPhoto: ['photo', 'title', 'tagline', 'barcode', 'classInfo', 'credits'],
-  svgType: ['title', 'tagline', 'barcode', 'classInfo', 'credits', 'corner'],
-};
-// SVG背景は書き出し品質を保つため、常にこの解像度でラスタライズしてstate.typoに渡す
-const SVG_BG_RES = [7016, 9933];
-
-// SVGレイヤーのUI定義。keyの先頭を大文字にした文字列がparamsのプロパティ名の接尾辞になる
-// (例: key='classInfo' → params.svgLayerClassInfo / X / Y / Scale)
-const SVG_LAYER_META = [
-  { key: 'photo', label: '背景写真' },
-  { key: 'title', label: 'タイトルロゴ' },
-  { key: 'tagline', label: 'キャッチコピー' },
-  { key: 'barcode', label: 'バーコード' },
-  { key: 'classInfo', label: '授業情報' },
-  { key: 'credits', label: 'クレジット' },
-  { key: 'corner', label: 'コーナーロゴ(JU)' },
-];
-const capKey = (k) => k[0].toUpperCase() + k.slice(1);
 
 const view = document.getElementById('view');
 view.width = PREVIEW_W;
@@ -202,16 +173,6 @@ const params = {
   smoothing: 0.75,
   typoVisible: true,
   typoVersion: 'ver4',
-  // SVG背景の要素ごとの表示/非表示(該当レイヤーが無いSVGでは無視される)
-  ...Object.fromEntries(SVG_LAYER_META.flatMap(({ key }) => {
-    const k = capKey(key);
-    return [
-      [`svgLayer${k}`, true],
-      [`svgLayer${k}X`, 0],
-      [`svgLayer${k}Y`, 0],
-      [`svgLayer${k}Scale`, 1],
-    ];
-  })),
   handTracking: false,
   rightHandBrush: 'stamp',
   leftHandBrush: 'stampTex',
@@ -719,99 +680,6 @@ function loadTypo(src) {
   img.src = src;
 }
 
-// ---- SVG背景(要素ごとに表示/非表示・位置・サイズを切り替えられるタイポ) ----
-const svgBackgrounds = {}; // baseKey(svgPhoto/svgType) -> loadSvgBackground()の結果(遅延読み込みしてキャッシュ)
-let svgRenderGen = 0; // 連続トグル時に古いラスタライズ結果で上書きしないためのガード
-
-// ---- 配置プリセットの永続化(localStorage) ----
-// 「この配置を保存」するたびにVer.5, Ver.6, ...と増えていく想定。
-// 番号は削除しても再利用しない(欠番があっても重複しない)よう別カウンタで管理する
-const SVG_PRESET_KEY = 'visualLan.svgPresets';
-const SVG_PRESET_COUNTER_KEY = 'visualLan.svgPresetNextVer';
-
-function loadSvgPresets() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(SVG_PRESET_KEY) || '[]');
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
-}
-function saveSvgPresetsToStorage() {
-  try {
-    localStorage.setItem(SVG_PRESET_KEY, JSON.stringify(svgPresets));
-  } catch (err) {
-    console.error('プリセットの保存に失敗:', err);
-  }
-}
-function nextVerNumber() {
-  const n = parseInt(localStorage.getItem(SVG_PRESET_COUNTER_KEY) || '5', 10);
-  localStorage.setItem(SVG_PRESET_COUNTER_KEY, String(n + 1));
-  return n;
-}
-const svgPresets = loadSvgPresets(); // [{ id, label, base, layers: { key: {visible,x,y,scale} } }]
-
-// typoVersionの現在値(生のSVGキー or 保存済みプリセットID)から、
-// 元になっているSVGソースのキー(svgPhoto/svgType)を求める。SVG系でなければnull
-function currentSvgBaseKey() {
-  const preset = svgPresets.find((p) => p.id === params.typoVersion);
-  if (preset) return preset.base;
-  return params.typoVersion in SVG_BG_SRC ? params.typoVersion : null;
-}
-
-// 現在のparamsが持つ表示/位置/サイズ設定を、SVG背景の各レイヤーに適用する
-function applyCurrentSvgLayerSettings(bg) {
-  for (const { key: layerKey } of SVG_LAYER_META) {
-    const k = capKey(layerKey);
-    setLayerVisible(bg, layerKey, params[`svgLayer${k}`]);
-    setLayerTransform(bg, layerKey, {
-      dx: params[`svgLayer${k}X`],
-      dy: params[`svgLayer${k}Y`],
-      scale: params[`svgLayer${k}Scale`],
-    });
-  }
-}
-
-// paramsの表示/位置/サイズを初期値(元のSVGそのまま)に戻す
-function resetSvgLayerParamsToDefault() {
-  for (const { key } of SVG_LAYER_META) {
-    const k = capKey(key);
-    params[`svgLayer${k}`] = true;
-    params[`svgLayer${k}X`] = 0;
-    params[`svgLayer${k}Y`] = 0;
-    params[`svgLayer${k}Scale`] = 1;
-  }
-}
-
-// 保存済みプリセットの値をparamsに反映してから再描画する
-async function applySvgPreset(preset) {
-  for (const { key } of SVG_LAYER_META) {
-    const k = capKey(key);
-    const v = preset.layers[key] || { visible: true, x: 0, y: 0, scale: 1 };
-    params[`svgLayer${k}`] = v.visible;
-    params[`svgLayer${k}X`] = v.x;
-    params[`svgLayer${k}Y`] = v.y;
-    params[`svgLayer${k}Scale`] = v.scale;
-  }
-  pane.refresh();
-  await updateSvgBackground();
-}
-
-async function updateSvgBackground() {
-  const base = currentSvgBaseKey();
-  if (!base) return;
-  const myGen = ++svgRenderGen;
-  if (!svgBackgrounds[base]) {
-    svgBackgrounds[base] = await loadSvgBackground(SVG_BG_SRC[base]);
-  }
-  const bg = svgBackgrounds[base];
-  applyCurrentSvgLayerSettings(bg);
-  const canvas = await rasterizeSvgBackground(bg, SVG_BG_RES[0], SVG_BG_RES[1]);
-  if (myGen !== svgRenderGen) return; // 途中で新しい変更が入ったので古い結果は捨てる
-  state.typo = canvas;
-  cacheTypoPreview();
-}
-
 // ---- Undo ----
 function undo() {
   if (!state.strokes.length) return;
@@ -887,8 +755,7 @@ function strokeLabel(stroke) {
 }
 
 // ---- レイヤー別書き出し(背景写真/ストロークごとの描画/タイポを個別ファイルにしてZIPにまとめる) ----
-// 写真・描画は背景透過PNG。タイポはSVG版なら要素ごとに透過SVG、PNG版なら
-// (実際の見た目と一致するよう)明暗適応の色つき透過PNG1枚にする
+// 写真・描画は背景透過PNG。タイポは(実際の見た目と一致するよう)明暗適応の色つき透過PNG1枚にする
 // 2枚のcanvasを比較し、変化があったピクセルだけを残した(他は透明)canvasを返す。
 // ストレッチ/ボカシなど「既存キャンバスの内容を読んで描く」エフェクトは、単独の空白
 // canvasに再生すると読み取り元が無く消えてしまうため、必ずこの差分方式で切り出す
@@ -958,35 +825,17 @@ async function exportLayers(onProgress) {
     }
   }
 
-  // 3. タイポ
-  if (params.typoVisible) {
-    const svgBase = currentSvgBaseKey();
-    if (svgBase) {
-      // SVG版(生のSVG or 保存済みプリセット): 現在の表示/位置/サイズ設定を反映した上で、
-      // 要素ごとに独立したベクターファイルとして書き出す
-      const key = svgBase;
-      if (!svgBackgrounds[key]) svgBackgrounds[key] = await loadSvgBackground(SVG_BG_SRC[key]);
-      applyCurrentSvgLayerSettings(svgBackgrounds[key]);
-      const avail = SVG_LAYER_AVAILABILITY[key];
-      for (const layerKey of avail) {
-        if (!params[`svgLayer${capKey(layerKey)}`]) continue;
-        // 元のbg(画面表示用)を汚さないよう複製してから、このレイヤーだけを残す
-        const exportBg = cloneForExport(svgBackgrounds[key]);
-        for (const other of avail) setLayerVisible(exportBg, other, other === layerKey);
-        zip.file(`${pad()}_typo_${layerKey}.svg`, serializeSvgBackground(exportBg));
-      }
-    } else if (state.typo) {
-      // PNG版: 実際の見た目(明暗に応じた白/黒反転)と一致する透過PNGにする。
-      // 下地は白地+写真+全ストローク(=cumulative)と、画面表示・PNG一括書き出しと全く同じもの
-      const typoHi = document.createElement('canvas');
-      typoHi.width = W;
-      typoHi.height = H;
-      drawCover(typoHi.getContext('2d'), state.typo, W, H);
-      const out = blank();
-      const dummy = blank();
-      drawTypoAdaptive(dummy.getContext('2d'), cumulative, typoHi, W, H, out);
-      zip.file(`${pad()}_typo.png`, await toPngBlob(out));
-    }
+  // 3. タイポ: 実際の見た目(明暗に応じた白/黒反転)と一致する透過PNGにする。
+  // 下地は白地+写真+全ストローク(=cumulative)と、画面表示・PNG一括書き出しと全く同じもの
+  if (params.typoVisible && state.typo) {
+    const typoHi = document.createElement('canvas');
+    typoHi.width = W;
+    typoHi.height = H;
+    drawCover(typoHi.getContext('2d'), state.typo, W, H);
+    const out = blank();
+    const dummy = blank();
+    drawTypoAdaptive(dummy.getContext('2d'), cumulative, typoHi, W, H, out);
+    zip.file(`${pad()}_typo.png`, await toPngBlob(out));
   }
 
   if (idx === 1) return; // 書き出す要素が無い
@@ -1135,110 +984,19 @@ captionFolder.addBinding(params, 'pathTextMargin', { label: '余白', min: 0, ma
 // -- 4. 背景レイヤー(タイポ/テクスチャ/写真) --
 const bgFolder = pane.addFolder({ title: '背景レイヤー', expanded: false });
 bgFolder.addBinding(params, 'typoVisible', { label: 'タイポ表示' });
-// タイポ版は保存済みプリセットが後から増えるため、optionsを差し替えられるlistブレードにする
-const TYPO_BASE_OPTIONS = [
-  { text: 'Ver.1 (縦組み)', value: 'ver1' },
-  { text: 'Ver.2 (横組み)', value: 'ver2' },
-  { text: 'Ver.3', value: 'ver3' },
-  { text: 'Ver.4', value: 'ver4' },
-  { text: 'SVG: 写真あり', value: 'svgPhoto' },
-  { text: 'SVG: タイポのみ(JUロゴ)', value: 'svgType' },
-];
-function typoVersionOptions() {
-  return [
-    ...TYPO_BASE_OPTIONS,
-    ...svgPresets.map((p) => ({ text: `${p.label} (保存した配置)`, value: p.id })),
-  ];
-}
-const typoVersionBlade = bgFolder.addBlade({
-  view: 'list',
+bgFolder.addBinding(params, 'typoVersion', {
   label: 'タイポ版',
-  options: typoVersionOptions(),
-  value: params.typoVersion,
+  options: {
+    'Ver.1 (縦組み)': 'ver1',
+    'Ver.2 (横組み)': 'ver2',
+    'Ver.3': 'ver3',
+    'Ver.4': 'ver4',
+    'Ver.5': 'ver5',
+    'Ver.6': 'ver6',
+  },
+}).on('change', (ev) => {
+  loadTypo(TYPO_SRC[ev.value]);
 });
-typoVersionBlade.on('change', (ev) => {
-  params.typoVersion = ev.value;
-  const preset = svgPresets.find((p) => p.id === ev.value);
-  if (preset) {
-    syncSvgLayerUI();
-    applySvgPreset(preset).catch((err) => console.error('プリセットの読み込みに失敗:', err));
-  } else if (ev.value in SVG_BG_SRC) {
-    resetSvgLayerParamsToDefault();
-    pane.refresh();
-    syncSvgLayerUI();
-    updateSvgBackground().catch((err) => console.error('SVG背景の読み込みに失敗:', err));
-  } else {
-    syncSvgLayerUI();
-    loadTypo(TYPO_SRC[ev.value]);
-  }
-});
-// SVG背景選択時のみ意味を持つ、要素ごとの表示/位置/サイズ。
-// レイヤーごとにサブフォルダを作り、表示チェック+X/Y/倍率をまとめる
-const svgLayerFolders = {};
-for (const { key, label } of SVG_LAYER_META) {
-  const k = capKey(key);
-  const f = bgFolder.addFolder({ title: `　└ ${label}`, expanded: false });
-  const bindings = [
-    f.addBinding(params, `svgLayer${k}`, { label: '表示' }),
-    f.addBinding(params, `svgLayer${k}X`, { label: 'X', min: -500, max: 500, step: 1 }),
-    f.addBinding(params, `svgLayer${k}Y`, { label: 'Y', min: -700, max: 700, step: 1 }),
-    f.addBinding(params, `svgLayer${k}Scale`, { label: '倍率', min: 0.2, max: 3, step: 0.01 }),
-  ];
-  for (const b of bindings) {
-    b.on('change', () => updateSvgBackground().catch((err) => console.error('SVG背景の更新に失敗:', err)));
-  }
-  svgLayerFolders[key] = f;
-}
-// 現在の配置をVer.5, Ver.6, ...として保存し、次回以降もタイポ版から選べるようにする
-const savePresetBtn = bgFolder.addButton({ title: 'この配置をVer.として保存' });
-savePresetBtn.on('click', () => {
-  const base = currentSvgBaseKey();
-  if (!base) return;
-  const layers = {};
-  for (const { key } of SVG_LAYER_META) {
-    const k = capKey(key);
-    layers[key] = {
-      visible: params[`svgLayer${k}`],
-      x: params[`svgLayer${k}X`],
-      y: params[`svgLayer${k}Y`],
-      scale: params[`svgLayer${k}Scale`],
-    };
-  }
-  const preset = { id: `preset_${Date.now()}`, label: `Ver.${nextVerNumber()}`, base, layers };
-  svgPresets.push(preset);
-  saveSvgPresetsToStorage();
-  typoVersionBlade.options = typoVersionOptions();
-  params.typoVersion = preset.id;
-  typoVersionBlade.value = preset.id;
-  syncSvgLayerUI();
-});
-// 保存済みプリセットを選択中のときだけ、削除できるようにする
-const deletePresetBtn = bgFolder.addButton({ title: 'このVer.を削除' });
-deletePresetBtn.on('click', () => {
-  const idx = svgPresets.findIndex((p) => p.id === params.typoVersion);
-  if (idx < 0) return;
-  const fallbackBase = svgPresets[idx].base;
-  svgPresets.splice(idx, 1);
-  saveSvgPresetsToStorage();
-  typoVersionBlade.options = typoVersionOptions();
-  params.typoVersion = fallbackBase;
-  typoVersionBlade.value = fallbackBase;
-  resetSvgLayerParamsToDefault();
-  pane.refresh();
-  syncSvgLayerUI();
-  updateSvgBackground().catch((err) => console.error('SVG背景の更新に失敗:', err));
-});
-// 現在選択中のSVGに存在しないレイヤーのフォルダ/保存・削除ボタンは隠す
-function syncSvgLayerUI() {
-  const base = currentSvgBaseKey();
-  const avail = base ? (SVG_LAYER_AVAILABILITY[base] || []) : [];
-  for (const [key, f] of Object.entries(svgLayerFolders)) {
-    f.hidden = !avail.includes(key);
-  }
-  savePresetBtn.hidden = !base;
-  deletePresetBtn.hidden = !svgPresets.some((p) => p.id === params.typoVersion);
-}
-syncSvgLayerUI();
 bgFolder.addButton({ title: 'タイポPNGを差し替え' }).on('click', () => {
   pickImage((img) => {
     state.typo = img;
@@ -1331,8 +1089,8 @@ exBtn.on('click', async () => {
     exBtn.title = 'PNG書き出し';
   }
 });
-// 写真/描画/タイポを個別ファイル(透過PNG、タイポがSVG版なら要素ごとに透過SVG)にしてZIPで書き出す
-const EX_LAYERS_LABEL = 'レイヤー別書き出し (PNG/SVG, ZIP)';
+// 写真/描画(ストロークごと)/タイポを個別の透過PNGにしてZIPで書き出す
+const EX_LAYERS_LABEL = 'レイヤー別書き出し (PNG, ZIP)';
 const exLayersBtn = exFolder.addButton({ title: EX_LAYERS_LABEL });
 exLayersBtn.on('click', async () => {
   exLayersBtn.title = '書き出し中…';
@@ -1373,6 +1131,5 @@ window.__vl = {
   state, params, anims, captionAnims, art, loadTypo, TYPO_SRC,
   pickStroke, deleteSelected, redrawArt, texturedImageId, tintedImageId,
   startReplayShow, isReplaying: () => !!replayQueue,
-  registerCustomStamp, updateSvgBackground, exportLayers,
-  svgPresets, applySvgPreset, currentSvgBaseKey,
+  registerCustomStamp, exportLayers,
 };

@@ -175,6 +175,7 @@ const params = {
   effectType: 'stretch',
   effectWidth: 100,
   effectBlur: 12,
+  effectShowHead: true,
   tipStyle: 'brush',
   pathText: false,
   pathTextContent: '新しい食品のカタチ',
@@ -241,6 +242,7 @@ function makeStroke(kind) {
           type: 'stretch',
           widthN: params.effectWidth / PREVIEW_W,
           mode: 'fixed',
+          showHead: params.effectShowHead,
         };
   }
   // パステキスト: ONならストロークに沿う文字をデータとして記録(リプレイでも同じ位置に出る)。
@@ -904,6 +906,8 @@ effectFolder.addBinding(params, 'effectType', {
 }).on('change', syncBrushUI);
 const uiEffectWidth = effectFolder.addBinding(params, 'effectWidth', { label: '幅', min: 4, max: 400, step: 1 });
 const uiEffectBlur = effectFolder.addBinding(params, 'effectBlur', { label: '強さ(ボカシ)', min: 2, max: 60, step: 1 });
+// ストレッチは先頭に1個だけスタンプが乗る(チューブの起点)。これ自体の表示も選べる
+const uiEffectShowHead = effectFolder.addBinding(params, 'effectShowHead', { label: '先頭のスタンプを表示' });
 const TIP_OPTIONS = { 'かすれ(ブラシ)': 'brush', '尖り': 'point' };
 const uiEffectTip = effectFolder.addBinding(params, 'tipStyle', { label: '先端', options: TIP_OPTIONS });
 uiEffectTip.on('change', () => pane.refresh());
@@ -1065,6 +1069,7 @@ function syncBrushUI() {
   uiEffectWidth.hidden = params.effectType === 'none';
   uiEffectTip.hidden = params.effectType !== 'stretch';
   uiEffectBlur.hidden = params.effectType !== 'blur';
+  uiEffectShowHead.hidden = params.effectType !== 'stretch';
 }
 syncBrushUI();
 

@@ -444,6 +444,8 @@ export class ImageStretchEngine {
     this.acc = 0;
     this.angSm = null; // 接線角のスムージング(急カーブで帯が折れて割れるのを防ぐ)
     this.headDrawn = false;
+    // 先頭に1個だけ置くスタンプの表示可否。falseなら線(チューブ)だけになる
+    this.showHead = stroke.effect.showHead !== false;
     this.single = (stroke.points || []).length < 2; // クリックのみ=スタンプ1個で終わり
     // 先端表現: 'point'=尖り / 'brush'=かすれ
     this.tip = stroke.tip || 'point';
@@ -497,10 +499,10 @@ export class ImageStretchEngine {
     const x = nx * this.W;
     const y = ny * this.H;
     if (this.single) {
-      // クリックのみ: 通常のスタンプと同じく1個置く
+      // クリックのみ: 通常のスタンプと同じく1個置く(表示OFFなら何も描かない)
       if (!this.headDrawn) {
         this.headDrawn = true;
-        this._drawHead(x, y, 0);
+        if (this.showHead) this._drawHead(x, y, 0);
       }
       return;
     }
@@ -520,13 +522,15 @@ export class ImageStretchEngine {
       const dy = this.smoothed.y - this.start.y;
       if (Math.hypot(dx, dy) < this.step * 2) return;
       if (!this._buildSlice()) return; // 画像未ロード時は描かない
-      // 1個目のスタンプを置き、その上をチューブが走り出す
+      // 1個目のスタンプを置き、その上をチューブが走り出す(表示OFFなら線だけになる)
       if (!this.headDrawn) {
         this.headDrawn = true;
-        this._drawHead(
-          this.start.x, this.start.y,
-          this.stroke.rotate ? Math.atan2(dy, dx) : 0
-        );
+        if (this.showHead) {
+          this._drawHead(
+            this.start.x, this.start.y,
+            this.stroke.rotate ? Math.atan2(dy, dx) : 0
+          );
+        }
       }
       this.prev = { x: this.start.x, y: this.start.y };
     }

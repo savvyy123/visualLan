@@ -1,8 +1,12 @@
 import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
+import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
 import { drawCover, replayStroke, createEngines, buildCaptionTrack } from './brush.js';
 import { startHandTracking, stopHandTracking, handCursors, HAND_POINTER_ID } from './hand.js';
 import { initCropTool } from './crop.js';
-import { loadSvgBackground, setLayerVisible, rasterizeSvgBackground } from './svgbg.js';
+import {
+  loadSvgBackground, setLayerVisible, setLayerTransform, rasterizeSvgBackground,
+  serializeSvgBackground, cloneForExport,
+} from './svgbg.js';
 
 const A1 = { w: 594, h: 841 };
 const PREVIEW_W = 1200;
@@ -29,6 +33,19 @@ const SVG_LAYER_AVAILABILITY = {
 };
 // SVG背景は書き出し品質を保つため、常にこの解像度でラスタライズしてstate.typoに渡す
 const SVG_BG_RES = [7016, 9933];
+
+// SVGレイヤーのUI定義。keyの先頭を大文字にした文字列がparamsのプロパティ名の接尾辞になる
+// (例: key='classInfo' → params.svgLayerClassInfo / X / Y / Scale)
+const SVG_LAYER_META = [
+  { key: 'photo', label: '背景写真' },
+  { key: 'title', label: 'タイトルロゴ' },
+  { key: 'tagline', label: 'キャッチコピー' },
+  { key: 'barcode', label: 'バーコード' },
+  { key: 'classInfo', label: '授業情報' },
+  { key: 'credits', label: 'クレジット' },
+  { key: 'corner', label: 'コーナーロゴ(JU)' },
+];
+const capKey = (k) => k[0].toUpperCase() + k.slice(1);
 
 const view = document.getElementById('view');
 view.width = PREVIEW_W;
@@ -186,13 +203,15 @@ const params = {
   typoVisible: true,
   typoVersion: 'ver4',
   // SVG背景の要素ごとの表示/非表示(該当レイヤーが無いSVGでは無視される)
-  svgLayerPhoto: true,
-  svgLayerTitle: true,
-  svgLayerTagline: true,
-  svgLayerBarcode: true,
-  svgLayerClassInfo: true,
-  svgLayerCredits: true,
-  svgLayerCorner: true,
+  ...Object.fromEntries(SVG_LAYER_META.flatMap(({ key }) => {
+    const k = capKey(key);
+    return [
+      [`svgLayer${k}`, true],
+      [`svgLayer${k}X`, 0],
+      [`svgLayer${k}Y`, 0],
+      [`svgLayer${k}Scale`, 1],
+    ];
+  })),
   handTracking: false,
   rightHandBrush: 'stamp',
   leftHandBrush: 'stampTex',
@@ -704,6 +723,19 @@ function loadTypo(src) {
 const svgBackgrounds = {}; // key -> loadSvgBackground()の結果(遅延読み込みしてキャッシュ)
 let svgRenderGen = 0; // 連続トグル時に古いラスタライズ結果で上書きしないためのガード
 
+// 現在のparamsが持つ表示/位置/サイズ設定を、SVG背景の各レイヤーに適用する
+function applyCurrentSvgLayerSettings(bg) {
+  for (const { key: layerKey } of SVG_LAYER_META) {
+    const k = capKey(layerKey);
+    setLayerVisible(bg, layerKey, params[`svgLayer${k}`]);
+    setLayerTransform(bg, layerKey, {
+      dx: params[`svgLayer${k}X`],
+      dy: params[`svgLayer${k}Y`],
+      scale: params[`svgLayer${k}Scale`],
+    });
+  }
+}
+
 async function updateSvgBackground() {
   const key = params.typoVersion;
   if (!(key in SVG_BG_SRC)) return;
@@ -712,13 +744,7 @@ async function updateSvgBackground() {
     svgBackgrounds[key] = await loadSvgBackground(SVG_BG_SRC[key]);
   }
   const bg = svgBackgrounds[key];
-  setLayerVisible(bg, 'photo', params.svgLayerPhoto);
-  setLayerVisible(bg, 'title', params.svgLayerTitle);
-  setLayerVisible(bg, 'tagline', params.svgLayerTagline);
-  setLayerVisible(bg, 'barcode', params.svgLayerBarcode);
-  setLayerVisible(bg, 'classInfo', params.svgLayerClassInfo);
-  setLayerVisible(bg, 'credits', params.svgLayerCredits);
-  setLayerVisible(bg, 'corner', params.svgLayerCorner);
+  applyCurrentSvgLayerSettings(bg);
   const canvas = await rasterizeSvgBackground(bg, SVG_BG_RES[0], SVG_BG_RES[1]);
   if (myGen !== svgRenderGen) return; // 途中で新しい変更が入ったので古い結果は捨てる
   state.typo = canvas;
@@ -782,6 +808,103 @@ async function exportPNG() {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `visualLan_A1_${params.dpi}dpi_${Date.now()}.png`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ファイル名に使えない文字を置換する
+function sanitizeFileName(s) {
+  return String(s).replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'x';
+}
+
+// ストローク1本の内容が分かる短いラベルを作る(ファイル名用)
+function strokeLabel(stroke) {
+  if (stroke.type === 'image') return `stamp_${sanitizeFileName(stroke.imageId)}`;
+  if (stroke.type === 'text') return 'barcode';
+  if (stroke.type === 'stretch') return 'stretch';
+  return stroke.type || 'stroke';
+}
+
+// ---- レイヤー別書き出し(背景写真/ストロークごとの描画/タイポを個別ファイルにしてZIPにまとめる) ----
+// 写真・描画は背景透過PNG。タイポはSVG版なら要素ごとに透過SVG、PNG版なら
+// (実際の見た目と一致するよう)明暗適応の色つき透過PNG1枚にする
+async function exportLayers(onProgress) {
+  const [W, H] = DPI_SIZE[params.dpi];
+  const zip = new JSZip();
+  let idx = 1;
+  const pad = () => String(idx++).padStart(2, '0');
+  const blank = () => {
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    return c;
+  };
+  const toPngBlob = (c) => new Promise((r) => c.toBlob(r, 'image/png'));
+
+  // 1. 背景写真/TDテクスチャ
+  if (state.photo) {
+    const c = blank();
+    drawCover(c.getContext('2d'), state.photo, W, H);
+    zip.file(`${pad()}_photo.png`, await toPngBlob(c));
+  }
+
+  // 2. 描画(ストロークごとに個別ファイル)。明暗適応タイポの下地計算のため、
+  // 全ストロークを合成したcanvasも(書き出しはせず)内部的に作っておく
+  let drawingCanvas = null;
+  if (state.strokes.length) {
+    drawingCanvas = blank();
+    const dctx = drawingCanvas.getContext('2d');
+    for (let i = 0; i < state.strokes.length; i++) {
+      const stroke = state.strokes[i];
+      onProgress?.(`描画 ${i + 1}/${state.strokes.length}`);
+      const single = blank();
+      replayStroke(single, stroke, state.images);
+      dctx.drawImage(single, 0, 0);
+      const n = String(i + 1).padStart(2, '0');
+      zip.file(`${pad()}_drawing_${n}_${strokeLabel(stroke)}.png`, await toPngBlob(single));
+    }
+  }
+
+  // 3. タイポ
+  if (params.typoVisible) {
+    if (params.typoVersion in SVG_BG_SRC) {
+      // SVG版: 現在の表示/位置/サイズ設定を反映した上で、要素ごとに独立したベクターファイルとして書き出す
+      const key = params.typoVersion;
+      if (!svgBackgrounds[key]) svgBackgrounds[key] = await loadSvgBackground(SVG_BG_SRC[key]);
+      applyCurrentSvgLayerSettings(svgBackgrounds[key]);
+      const avail = SVG_LAYER_AVAILABILITY[key];
+      for (const layerKey of avail) {
+        if (!params[`svgLayer${capKey(layerKey)}`]) continue;
+        // 元のbg(画面表示用)を汚さないよう複製してから、このレイヤーだけを残す
+        const exportBg = cloneForExport(svgBackgrounds[key]);
+        for (const other of avail) setLayerVisible(exportBg, other, other === layerKey);
+        zip.file(`${pad()}_typo_${layerKey}.svg`, serializeSvgBackground(exportBg));
+      }
+    } else if (state.typo) {
+      // PNG版: 実際の見た目(明暗に応じた白/黒反転)と一致する透過PNGにする
+      const typoHi = document.createElement('canvas');
+      typoHi.width = W;
+      typoHi.height = H;
+      drawCover(typoHi.getContext('2d'), state.typo, W, H);
+      const backdrop = state.photo || drawingCanvas ? blank() : null;
+      if (backdrop) {
+        const bctx = backdrop.getContext('2d');
+        if (state.photo) drawCover(bctx, state.photo, W, H);
+        if (drawingCanvas) bctx.drawImage(drawingCanvas, 0, 0);
+      }
+      const out = blank();
+      const dummy = blank();
+      drawTypoAdaptive(dummy.getContext('2d'), backdrop || blank(), typoHi, W, H, out);
+      zip.file(`${pad()}_typo.png`, await toPngBlob(out));
+    }
+  }
+
+  if (idx === 1) return; // 書き出す要素が無い
+
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zipBlob);
+  a.download = `visualLan_A1_layers_${params.dpi}dpi_${Date.now()}.zip`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
@@ -940,24 +1063,28 @@ bgFolder.addBinding(params, 'typoVersion', {
     loadTypo(TYPO_SRC[ev.value]);
   }
 });
-// SVG背景選択時のみ意味を持つ、要素ごとの表示切り替え
-const svgLayerBindings = {
-  photo: bgFolder.addBinding(params, 'svgLayerPhoto', { label: '　└ 背景写真' }),
-  title: bgFolder.addBinding(params, 'svgLayerTitle', { label: '　└ タイトルロゴ' }),
-  tagline: bgFolder.addBinding(params, 'svgLayerTagline', { label: '　└ キャッチコピー' }),
-  barcode: bgFolder.addBinding(params, 'svgLayerBarcode', { label: '　└ バーコード' }),
-  classInfo: bgFolder.addBinding(params, 'svgLayerClassInfo', { label: '　└ 授業情報' }),
-  credits: bgFolder.addBinding(params, 'svgLayerCredits', { label: '　└ クレジット' }),
-  corner: bgFolder.addBinding(params, 'svgLayerCorner', { label: '　└ コーナーロゴ(JU)' }),
-};
-for (const b of Object.values(svgLayerBindings)) {
-  b.on('change', () => updateSvgBackground().catch((err) => console.error('SVG背景の更新に失敗:', err)));
+// SVG背景選択時のみ意味を持つ、要素ごとの表示/位置/サイズ。
+// レイヤーごとにサブフォルダを作り、表示チェック+X/Y/倍率をまとめる
+const svgLayerFolders = {};
+for (const { key, label } of SVG_LAYER_META) {
+  const k = capKey(key);
+  const f = bgFolder.addFolder({ title: `　└ ${label}`, expanded: false });
+  const bindings = [
+    f.addBinding(params, `svgLayer${k}`, { label: '表示' }),
+    f.addBinding(params, `svgLayer${k}X`, { label: 'X', min: -500, max: 500, step: 1 }),
+    f.addBinding(params, `svgLayer${k}Y`, { label: 'Y', min: -700, max: 700, step: 1 }),
+    f.addBinding(params, `svgLayer${k}Scale`, { label: '倍率', min: 0.2, max: 3, step: 0.01 }),
+  ];
+  for (const b of bindings) {
+    b.on('change', () => updateSvgBackground().catch((err) => console.error('SVG背景の更新に失敗:', err)));
+  }
+  svgLayerFolders[key] = f;
 }
-// 現在選択中のSVGに存在しないレイヤーの行は隠す(存在しないSVG版なら全部隠す)
+// 現在選択中のSVGに存在しないレイヤーのフォルダは隠す(存在しないSVG版なら全部隠す)
 function syncSvgLayerUI() {
   const avail = SVG_LAYER_AVAILABILITY[params.typoVersion] || [];
-  for (const [key, b] of Object.entries(svgLayerBindings)) {
-    b.hidden = !avail.includes(key);
+  for (const [key, f] of Object.entries(svgLayerFolders)) {
+    f.hidden = !avail.includes(key);
   }
 }
 syncSvgLayerUI();
@@ -1053,6 +1180,17 @@ exBtn.on('click', async () => {
     exBtn.title = 'PNG書き出し';
   }
 });
+// 写真/描画/タイポを個別ファイル(透過PNG、タイポがSVG版なら要素ごとに透過SVG)にしてZIPで書き出す
+const exLayersBtn = exFolder.addButton({ title: 'レイヤー別書き出し (ZIP)' });
+exLayersBtn.on('click', async () => {
+  exLayersBtn.title = '書き出し中…';
+  await new Promise((r) => setTimeout(r, 50));
+  try {
+    await exportLayers((msg) => { exLayersBtn.title = msg; });
+  } finally {
+    exLayersBtn.title = 'レイヤー別書き出し (ZIP)';
+  }
+});
 
 // 選択中のブラシ/エフェクト/スタンプ画像に応じて、関係あるフォルダを開き無関係な項目を隠す
 function syncBrushUI() {
@@ -1083,5 +1221,5 @@ window.__vl = {
   state, params, anims, captionAnims, art, loadTypo, TYPO_SRC,
   pickStroke, deleteSelected, redrawArt, texturedImageId, tintedImageId,
   startReplayShow, isReplaying: () => !!replayQueue,
-  registerCustomStamp, updateSvgBackground,
+  registerCustomStamp, updateSvgBackground, exportLayers,
 };

@@ -2,6 +2,7 @@ import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpan
 import { drawCover, replayStroke, createEngines, buildCaptionTrack } from './brush.js';
 import { startHandTracking, stopHandTracking, handCursors, HAND_POINTER_ID } from './hand.js';
 import { initCropTool } from './crop.js';
+import { loadSvgBackground, setLayerVisible, rasterizeSvgBackground } from './svgbg.js';
 
 const A1 = { w: 594, h: 841 };
 const PREVIEW_W = 1200;
@@ -14,6 +15,20 @@ const TYPO_SRC = {
   ver3: 'assets/posterVisualLanVer3.png',
   ver4: 'assets/posterVisualLanVer4.png',
 };
+
+// SVG背景(要素ごとに表示/非表示を切り替えられる版)。
+// svgPhoto=写真+タイポ一式、svgType=タイポのみ(コーナーのJUロゴ付き)
+const SVG_BG_SRC = {
+  svgPhoto: 'assets/posterVisualLanVer2-02.svg',
+  svgType: 'assets/posterVisualLanVer2-03.svg',
+};
+// どのSVGにどのレイヤーが含まれるか(loadSvgBackground前でもUIの出し分けに使う)
+const SVG_LAYER_AVAILABILITY = {
+  svgPhoto: ['photo', 'title', 'tagline', 'barcode', 'classInfo', 'credits'],
+  svgType: ['title', 'tagline', 'barcode', 'classInfo', 'credits', 'corner'],
+};
+// SVG背景は書き出し品質を保つため、常にこの解像度でラスタライズしてstate.typoに渡す
+const SVG_BG_RES = [7016, 9933];
 
 const view = document.getElementById('view');
 view.width = PREVIEW_W;
@@ -169,6 +184,14 @@ const params = {
   smoothing: 0.75,
   typoVisible: true,
   typoVersion: 'ver4',
+  // SVG背景の要素ごとの表示/非表示(該当レイヤーが無いSVGでは無視される)
+  svgLayerPhoto: true,
+  svgLayerTitle: true,
+  svgLayerTagline: true,
+  svgLayerBarcode: true,
+  svgLayerClassInfo: true,
+  svgLayerCredits: true,
+  svgLayerCorner: true,
   handTracking: false,
   rightHandBrush: 'stamp',
   leftHandBrush: 'stampTex',
@@ -675,6 +698,31 @@ function loadTypo(src) {
   img.src = src;
 }
 
+// ---- SVG背景(要素ごとに表示/非表示を切り替えられるタイポ) ----
+const svgBackgrounds = {}; // key -> loadSvgBackground()の結果(遅延読み込みしてキャッシュ)
+let svgRenderGen = 0; // 連続トグル時に古いラスタライズ結果で上書きしないためのガード
+
+async function updateSvgBackground() {
+  const key = params.typoVersion;
+  if (!(key in SVG_BG_SRC)) return;
+  const myGen = ++svgRenderGen;
+  if (!svgBackgrounds[key]) {
+    svgBackgrounds[key] = await loadSvgBackground(SVG_BG_SRC[key]);
+  }
+  const bg = svgBackgrounds[key];
+  setLayerVisible(bg, 'photo', params.svgLayerPhoto);
+  setLayerVisible(bg, 'title', params.svgLayerTitle);
+  setLayerVisible(bg, 'tagline', params.svgLayerTagline);
+  setLayerVisible(bg, 'barcode', params.svgLayerBarcode);
+  setLayerVisible(bg, 'classInfo', params.svgLayerClassInfo);
+  setLayerVisible(bg, 'credits', params.svgLayerCredits);
+  setLayerVisible(bg, 'corner', params.svgLayerCorner);
+  const canvas = await rasterizeSvgBackground(bg, SVG_BG_RES[0], SVG_BG_RES[1]);
+  if (myGen !== svgRenderGen) return; // 途中で新しい変更が入ったので古い結果は捨てる
+  state.typo = canvas;
+  cacheTypoPreview();
+}
+
 // ---- Undo ----
 function undo() {
   if (!state.strokes.length) return;
@@ -877,10 +925,38 @@ bgFolder.addBinding(params, 'typoVersion', {
     'Ver.2 (横組み)': 'ver2',
     'Ver.3': 'ver3',
     'Ver.4': 'ver4',
+    'SVG: 写真あり': 'svgPhoto',
+    'SVG: タイポのみ(JUロゴ)': 'svgType',
   },
 }).on('change', (ev) => {
-  loadTypo(TYPO_SRC[ev.value]);
+  syncSvgLayerUI();
+  if (ev.value in SVG_BG_SRC) {
+    updateSvgBackground().catch((err) => console.error('SVG背景の読み込みに失敗:', err));
+  } else {
+    loadTypo(TYPO_SRC[ev.value]);
+  }
 });
+// SVG背景選択時のみ意味を持つ、要素ごとの表示切り替え
+const svgLayerBindings = {
+  photo: bgFolder.addBinding(params, 'svgLayerPhoto', { label: '　└ 背景写真' }),
+  title: bgFolder.addBinding(params, 'svgLayerTitle', { label: '　└ タイトルロゴ' }),
+  tagline: bgFolder.addBinding(params, 'svgLayerTagline', { label: '　└ キャッチコピー' }),
+  barcode: bgFolder.addBinding(params, 'svgLayerBarcode', { label: '　└ バーコード' }),
+  classInfo: bgFolder.addBinding(params, 'svgLayerClassInfo', { label: '　└ 授業情報' }),
+  credits: bgFolder.addBinding(params, 'svgLayerCredits', { label: '　└ クレジット' }),
+  corner: bgFolder.addBinding(params, 'svgLayerCorner', { label: '　└ コーナーロゴ(JU)' }),
+};
+for (const b of Object.values(svgLayerBindings)) {
+  b.on('change', () => updateSvgBackground().catch((err) => console.error('SVG背景の更新に失敗:', err)));
+}
+// 現在選択中のSVGに存在しないレイヤーの行は隠す(存在しないSVG版なら全部隠す)
+function syncSvgLayerUI() {
+  const avail = SVG_LAYER_AVAILABILITY[params.typoVersion] || [];
+  for (const [key, b] of Object.entries(svgLayerBindings)) {
+    b.hidden = !avail.includes(key);
+  }
+}
+syncSvgLayerUI();
 bgFolder.addButton({ title: 'タイポPNGを差し替え' }).on('click', () => {
   pickImage((img) => {
     state.typo = img;
@@ -1002,5 +1078,5 @@ window.__vl = {
   state, params, anims, captionAnims, art, loadTypo, TYPO_SRC,
   pickStroke, deleteSelected, redrawArt, texturedImageId, tintedImageId,
   startReplayShow, isReplaying: () => !!replayQueue,
-  registerCustomStamp,
+  registerCustomStamp, updateSvgBackground,
 };

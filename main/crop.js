@@ -1,6 +1,8 @@
 // crop.js — 画像を読み込んでトリミングし、カスタムスタンプとして登録するツール。
 // キャンバスの外(左余白)に固定表示される作業パネル。作品には直接描画しない。
 
+import { makeDraggable } from './drag.js';
+
 const PREVIEW_MAX = 240; // プレビュー領域の一辺の最大サイズ(px)
 const HANDLE_R = 9; // リサイズハンドルの当たり半径(px)
 
@@ -47,6 +49,7 @@ export function initCropTool(onAdd) {
   wrap.appendChild(addBtn);
 
   document.body.appendChild(wrap);
+  makeDraggable(title, wrap, { storageKey: 'vl_croptool_pos' });
 
   const ctx = canvas.getContext('2d');
   let img = null;

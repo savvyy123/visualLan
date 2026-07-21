@@ -2,6 +2,8 @@
 // 各手の人差し指の先(ランドマーク8)をカーソルにし、親指(4)とのピンチ中だけ描画する。
 // 手ごとに固有のpointerIdで合成PointerEventを流すので、左右同時に別ストロークを描ける。
 
+import { makeDraggable } from './drag.js';
+
 const MP_VERSION = '0.10.14';
 const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
 const BUNDLE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/vision_bundle.mjs`;
@@ -104,6 +106,7 @@ export async function startHandTracking(view) {
     video.muted = true;
     video.playsInline = true;
     document.body.appendChild(video);
+    makeDraggable(video, video, { storageKey: 'vl_handcam_pos' });
     stream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480, facingMode: 'user' },
     });

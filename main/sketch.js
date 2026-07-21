@@ -3,6 +3,7 @@ import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
 import { drawCover, replayStroke, createEngines, buildCaptionTrack } from './brush.js';
 import { startHandTracking, stopHandTracking, handCursors, HAND_POINTER_ID } from './hand.js';
 import { initCropTool } from './crop.js';
+import { makeDraggable } from './drag.js';
 
 const A1 = { w: 594, h: 841 };
 const PREVIEW_W = 1200;
@@ -75,6 +76,7 @@ function cacheTypoPreview() {
   c.height = PREVIEW_H;
   drawCover(c.getContext('2d'), state.typo, PREVIEW_W, PREVIEW_H);
   state.typoPreview = c;
+  artDirty = true;
 }
 
 // プレビュー用のタイポ合成ワークキャンバス(毎フレームの確保を避ける)
@@ -190,6 +192,7 @@ function resetBase(canvas) {
 function redrawArt() {
   resetBase(art);
   for (const stroke of state.strokes) replayStroke(art, stroke, state.images);
+  artDirty = true;
 }
 
 // ---- ライブ描画 ----
@@ -197,6 +200,8 @@ function redrawArt() {
 // マウスと左右の手で同時に描けるよう、ポインタIDごとにライブストロークを持つ
 const liveStrokes = new Map(); // pointerId -> stroke
 const anims = []; // { stroke, engines, fed, start }
+// artの見た目が変わったフレームだけ、タイポの明暗合成(重いcanvasフィルタ)を作り直す
+let artDirty = true;
 // パステキストの演出(線の描き終わり後に 出現→静止→消滅)。作品キャンバスには焼き込まない
 const captionAnims = []; // { slots, sizePx, offPx, color, start }
 
@@ -387,6 +392,7 @@ function startReplayShow() {
   state.selected = null;
   replayQueue = state.strokes.slice();
   resetBase(art); // 白紙(写真レイヤーのみ)に戻してから積み上げ直す
+  artDirty = true;
 }
 
 // 描画操作や削除が入ったら演出は中断し、完成状態に戻す
@@ -502,7 +508,19 @@ function drawGuide(points, from = 0, straight = false) {
 }
 
 // ---- 表示ループ ----
+// 1フレームが例外を投げてもrequestAnimationFrameの再スケジュールだけは必ず行う。
+// (末尾のrequestAnimationFrame呼び出し手前で例外が出ると、ループそのものが
+//  二度と回らなくなり「背景の文字が最初から出ない」ような症状につながるため)
 function frame(now = performance.now()) {
+  try {
+    frameBody(now);
+  } catch (err) {
+    console.error('frame() error:', err);
+  }
+  requestAnimationFrame(frame);
+}
+
+function frameBody(now) {
   // 遅延+イージングで、点列を進行度ぶんだけエンジンに流し込む
   for (let i = anims.length - 1; i >= 0; i--) {
     const a = anims[i];
@@ -515,6 +533,7 @@ function frame(now = performance.now()) {
     while (a.fed < pts.length && (a.total === 0 || a.cum[a.fed] <= targetLen)) {
       const pt = pts[a.fed++];
       for (const en of a.engines) en.addPoint(pt.x, pt.y);
+      artDirty = true;
     }
     if (t >= 1) {
       anims.splice(i, 1);
@@ -535,7 +554,14 @@ function frame(now = performance.now()) {
   }
   vctx.drawImage(art, 0, 0);
   if (params.typoVisible && state.typoPreview) {
-    drawTypoAdaptive(vctx, art, state.typoPreview, PREVIEW_W, PREVIEW_H, typoWork);
+    // artが変化したフレームだけ明暗合成(フィルタ処理)をやり直し、
+    // 変化がない間は前フレームのtypoWorkをそのまま貼るだけにして負荷を下げる
+    if (artDirty) {
+      drawTypoAdaptive(vctx, art, state.typoPreview, PREVIEW_W, PREVIEW_H, typoWork);
+      artDirty = false;
+    } else {
+      vctx.drawImage(typoWork, 0, 0);
+    }
   }
   // ガイド: ドラッグ中の軌跡と、描画待ち〜描画中の残り区間
   // (Aキーのリプレイ演出中はガイドを出さず、描画だけを見せる)
@@ -622,7 +648,6 @@ function frame(now = performance.now()) {
     vctx.stroke();
     vctx.restore();
   }
-  requestAnimationFrame(frame);
 }
 
 // 選択枠: 軌跡の破線と、ヒット半径ぶん膨らませたバウンディングボックス
@@ -671,11 +696,19 @@ function pickImage(onload) {
   input.click();
 }
 
-function loadTypo(src) {
+function loadTypo(src, retriesLeft = 2) {
   const img = new Image();
   img.onload = () => {
     state.typo = img;
     cacheTypoPreview();
+  };
+  img.onerror = () => {
+    if (retriesLeft > 0) {
+      console.warn(`タイポ画像の読み込みに失敗、再試行します: ${src}`);
+      setTimeout(() => loadTypo(src, retriesLeft - 1), 300);
+    } else {
+      console.error(`タイポ画像の読み込みに失敗しました: ${src}`);
+    }
   };
   img.src = src;
 }
@@ -853,6 +886,13 @@ async function exportLayers(onProgress) {
 // ハンド入力/演出 → 書き出し。選択中のブラシに関係あるフォルダだけを自動で開き、
 // 状況に合わない項目(TD色と質感、エフェクトのモード等)は隠す
 const pane = new Pane({ title: 'A1 Poster Tool' });
+{
+  const paneWrap = pane.element.closest('.tp-dfwv');
+  const paneHandle = pane.element.querySelector(':scope > .tp-rotv_b');
+  if (paneWrap && paneHandle) {
+    makeDraggable(paneHandle, paneWrap, { storageKey: 'vl_pane_pos' });
+  }
+}
 
 const COLOR_PRESETS = [
   { text: 'グリーン #31ff79', value: '#31ff79' },

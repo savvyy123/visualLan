@@ -451,6 +451,7 @@ const SEQUENCE_HOLD_MS = 1800; // 1件描き終えてから、次のフェード
 let sequence = null; // { savedStrokes, index, holding, holdUntil }
 
 function playSequenceTake(index) {
+  randomizeTypoVersion(); // 背景レイヤーは前の作品と被らないようランダムに切り替える
   state.strokes = cloneStrokes(state.takes[index].strokes);
   startReplayShow();
 }
@@ -819,6 +820,16 @@ function loadTypo(src, retriesLeft = 2) {
   img.src = src;
 }
 
+// 背景レイヤー(タイポ版)を、直前と被らないようにランダムに切り替える
+function randomizeTypoVersion() {
+  const keys = Object.keys(TYPO_SRC);
+  const candidates = keys.length > 1 ? keys.filter((k) => k !== params.typoVersion) : keys;
+  const next = candidates[Math.floor(Math.random() * candidates.length)];
+  params.typoVersion = next;
+  loadTypo(TYPO_SRC[next]);
+  pane.refresh();
+}
+
 // ---- リセット ----
 // Rキーで、描いたストロークを全部消して白紙(写真レイヤーのみ)に戻す
 function resetCanvas() {
@@ -840,6 +851,7 @@ function registerTake() {
   state.takes.push({ id: Date.now(), strokes: cloneStrokes(state.strokes) });
   saveTakesToStorage();
   console.log(`作品を登録しました(全${state.takes.length}件)`);
+  randomizeTypoVersion();
   resetCanvas();
 }
 

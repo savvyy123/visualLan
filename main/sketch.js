@@ -159,7 +159,7 @@ const params = {
   rotate: true,
   animDelay: 0.4,
   animDuration: 0.7,
-  barcodeText: 'VISUAL LAN',
+  barcodeText: 'IDC VISUAL LAN',
   barcodeSize: 120,
   barcodeColor: '#000000',
   effectType: 'stretch',
@@ -167,14 +167,14 @@ const params = {
   effectBlur: 12,
   effectShowHead: true,
   tipStyle: 'brush',
-  pathText: false,
+  pathText: true,
   pathTextContent: '新しい食品のカタチ',
   pathTextSize: 34,
   pathTextMargin: 24,
   brushWidth: 60,
   smoothing: 0.75,
   typoVisible: true,
-  typoVersion: 'ver4',
+  typoVersion: 'ver6',
   handTracking: false,
   rightHandBrush: 'stamp',
   leftHandBrush: 'stampTex',
@@ -384,12 +384,22 @@ function pickStroke(p) {
 // ---- リプレイ演出 ----
 // Aキーで、描いた軌跡を白紙から順番にアニメーション再生する
 let replayQueue = null; // 再生待ちのストローク列(先頭から順に演出)
+const FADE_OUT_MS = 450; // 開始時、今の見た目が消えるまでのフェード時間
+let fadeOut = null; // { canvas, start } 消える瞬間の見た目を焼き付けたスナップショット
 
 function startReplayShow() {
   if (!state.strokes.length) return;
   anims.length = 0;
   captionAnims.length = 0;
   state.selected = null;
+
+  // 消える瞬間の見た目(タイポ込みの現在表示)をそのまま撮って、フェードアウトの素材にする
+  const snap = document.createElement('canvas');
+  snap.width = PREVIEW_W;
+  snap.height = PREVIEW_H;
+  snap.getContext('2d').drawImage(view, 0, 0);
+  fadeOut = { canvas: snap, start: performance.now() };
+
   replayQueue = state.strokes.slice();
   resetBase(art); // 白紙(写真レイヤーのみ)に戻してから積み上げ直す
   artDirty = true;
@@ -397,6 +407,7 @@ function startReplayShow() {
 
 // 描画操作や削除が入ったら演出は中断し、完成状態に戻す
 function cancelReplayShow() {
+  fadeOut = null;
   if (!replayQueue) return;
   replayQueue = null;
   anims.length = 0;
@@ -545,10 +556,11 @@ function frameBody(now) {
     }
   }
   // リプレイ演出: 前のストロークを描き終えたら次を投入する
+  // (フェードアウトが終わるまでは、最初のストロークの投入を待つ)
   if (replayQueue) {
     if (!replayQueue.length && !anims.length) {
       replayQueue = null; // 全部描き終わった
-    } else if (!anims.length) {
+    } else if (!anims.length && !fadeOut) {
       anims.push(makeAnim(replayQueue.shift()));
     }
   }
@@ -648,6 +660,19 @@ function frameBody(now) {
     vctx.stroke();
     vctx.restore();
   }
+  // Aキー演出の開始直後: 直前の見た目のスナップショットを、下のまっさらな状態の上に
+  // 不透明度を落としながら重ねることで「各要素がふわっと消える」ように見せる
+  if (fadeOut) {
+    const t = (now - fadeOut.start) / FADE_OUT_MS;
+    if (t >= 1) {
+      fadeOut = null;
+    } else {
+      vctx.save();
+      vctx.globalAlpha = 1 - t;
+      vctx.drawImage(fadeOut.canvas, 0, 0);
+      vctx.restore();
+    }
+  }
 }
 
 // 選択枠: 軌跡の破線と、ヒット半径ぶん膨らませたバウンディングボックス
@@ -713,6 +738,19 @@ function loadTypo(src, retriesLeft = 2) {
   img.src = src;
 }
 
+// ---- リセット ----
+// Rキーで、描いたストロークを全部消して白紙(写真レイヤーのみ)に戻す
+function resetCanvas() {
+  if (!state.strokes.length) return;
+  replayQueue = null;
+  fadeOut = null;
+  anims.length = 0;
+  captionAnims.length = 0;
+  state.selected = null;
+  state.strokes.length = 0;
+  redrawArt();
+}
+
 // ---- Undo ----
 function undo() {
   if (!state.strokes.length) return;
@@ -742,6 +780,8 @@ window.addEventListener('keydown', (e) => {
     cancelReplayShow();
   } else if ((e.key === 'a' || e.key === 'A') && !e.metaKey && !e.ctrlKey) {
     startReplayShow();
+  } else if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) {
+    resetCanvas();
   }
 });
 

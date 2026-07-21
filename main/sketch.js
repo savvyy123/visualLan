@@ -50,7 +50,34 @@ const state = {
   strokes: [],
   images: {},
   selected: null, // 選択モードで掴んでいるストローク
+  takes: [], // Enterキーで登録した作品(それぞれ{ id, strokes })。Qキーで順番に再生する
 };
+
+// takes(登録済み作品)はlocalStorageに永続化する
+const TAKES_STORAGE_KEY = 'vl_takes';
+
+function cloneStrokes(strokes) {
+  return JSON.parse(JSON.stringify(strokes));
+}
+
+function loadTakesFromStorage() {
+  try {
+    const raw = localStorage.getItem(TAKES_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) state.takes = parsed;
+  } catch (err) {
+    console.warn('登録済み作品の読み込みに失敗しました:', err);
+  }
+}
+
+function saveTakesToStorage() {
+  try {
+    localStorage.setItem(TAKES_STORAGE_KEY, JSON.stringify(state.takes));
+  } catch (err) {
+    console.warn('登録済み作品の保存に失敗しました(容量オーバー等):', err);
+  }
+}
 
 // タイポ合成: 下地の暗い部分では白文字、明るい部分では黒文字として描く。
 // 下地をグレースケール→反転→強コントラストで白黒2値化し、タイポのアルファで切り抜くと
@@ -408,11 +435,56 @@ function startReplayShow() {
 // 描画操作や削除が入ったら演出は中断し、完成状態に戻す
 function cancelReplayShow() {
   fadeOut = null;
+  if (sequence) {
+    stopSequencePlayback();
+    return;
+  }
   if (!replayQueue) return;
   replayQueue = null;
   anims.length = 0;
   captionAnims.length = 0;
   redrawArt();
+}
+
+// ---- 連続再生(Qキー): 登録済みの作品(takes)を1件ずつフェード→再生し、最後まで行ったらループする ----
+const SEQUENCE_HOLD_MS = 1800; // 1件描き終えてから、次のフェードアウトに移るまでの静止時間
+let sequence = null; // { savedStrokes, index, holding, holdUntil }
+
+function playSequenceTake(index) {
+  state.strokes = cloneStrokes(state.takes[index].strokes);
+  startReplayShow();
+}
+
+function startSequencePlayback() {
+  if (!state.takes.length || sequence) return;
+  sequence = { savedStrokes: state.strokes, index: 0, holding: false, holdUntil: 0 };
+  console.log(`連続再生を開始します(${state.takes.length}件)`);
+  playSequenceTake(0);
+}
+
+function stopSequencePlayback() {
+  if (!sequence) return;
+  const restore = sequence.savedStrokes;
+  sequence = null;
+  replayQueue = null;
+  fadeOut = null;
+  anims.length = 0;
+  captionAnims.length = 0;
+  state.selected = null;
+  state.strokes = restore;
+  redrawArt();
+  console.log('連続再生を停止しました');
+}
+
+function toggleSequencePlayback() {
+  if (sequence) stopSequencePlayback();
+  else startSequencePlayback();
+}
+
+function advanceSequence() {
+  if (!sequence) return;
+  sequence.index = (sequence.index + 1) % state.takes.length;
+  playSequenceTake(sequence.index);
 }
 
 function deleteSelected() {
@@ -560,9 +632,18 @@ function frameBody(now) {
   if (replayQueue) {
     if (!replayQueue.length && !anims.length) {
       replayQueue = null; // 全部描き終わった
+      if (sequence && !sequence.holding) {
+        // 連続再生中: しばらく静止表示してから次の作品のフェードアウトに移る
+        sequence.holding = true;
+        sequence.holdUntil = now + SEQUENCE_HOLD_MS;
+      }
     } else if (!anims.length && !fadeOut) {
       anims.push(makeAnim(replayQueue.shift()));
     }
+  }
+  if (sequence && sequence.holding && now >= sequence.holdUntil) {
+    sequence.holding = false;
+    advanceSequence();
   }
   vctx.drawImage(art, 0, 0);
   if (params.typoVisible && state.typoPreview) {
@@ -751,6 +832,37 @@ function resetCanvas() {
   redrawArt();
 }
 
+// ---- 作品登録(Enterキー) ----
+// 今キャンバスにある全ストロークを1作品としてtakesに登録し、localStorageに保存。
+// 登録後は次の作品をすぐ描き始められるよう白紙に戻す
+function registerTake() {
+  if (sequence || !state.strokes.length) return;
+  state.takes.push({ id: Date.now(), strokes: cloneStrokes(state.strokes) });
+  saveTakesToStorage();
+  console.log(`作品を登録しました(全${state.takes.length}件)`);
+  resetCanvas();
+}
+
+// ---- 表示モード(F: フルスクリーン / H: UIの表示切替) ----
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch((err) => console.error('フルスクリーン化に失敗:', err));
+  } else {
+    document.exitFullscreen();
+  }
+}
+
+let uiVisible = true;
+function toggleUI() {
+  uiVisible = !uiVisible;
+  const disp = uiVisible ? '' : 'none';
+  const paneWrap = pane.element.closest('.tp-dfwv');
+  if (paneWrap) paneWrap.style.display = disp;
+  const croptool = document.getElementById('croptool');
+  if (croptool) croptool.style.display = disp;
+  // カメラ(#handcam)はここでは触らない
+}
+
 // ---- Undo ----
 function undo() {
   if (!state.strokes.length) return;
@@ -782,6 +894,14 @@ window.addEventListener('keydown', (e) => {
     startReplayShow();
   } else if ((e.key === 'r' || e.key === 'R') && !e.metaKey && !e.ctrlKey) {
     resetCanvas();
+  } else if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey) {
+    toggleFullscreen();
+  } else if ((e.key === 'h' || e.key === 'H') && !e.metaKey && !e.ctrlKey) {
+    toggleUI();
+  } else if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey) {
+    registerTake();
+  } else if ((e.key === 'q' || e.key === 'Q') && !e.metaKey && !e.ctrlKey) {
+    toggleSequencePlayback();
   }
 });
 
@@ -1204,6 +1324,7 @@ syncBrushUI();
 // ---- 起動 ----
 resetBase(art);
 loadTypo(TYPO_SRC[params.typoVersion]);
+loadTakesFromStorage();
 frame();
 
 // デバッグ/外部連携用(TD連携時にも使う想定)
@@ -1212,4 +1333,5 @@ window.__vl = {
   pickStroke, deleteSelected, redrawArt, texturedImageId, tintedImageId,
   startReplayShow, isReplaying: () => !!replayQueue,
   registerCustomStamp, exportLayers,
+  registerTake, toggleSequencePlayback, isSequencePlaying: () => !!sequence,
 };

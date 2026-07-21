@@ -110,6 +110,12 @@ function cacheTypoPreview() {
 const typoWork = document.createElement('canvas');
 typoWork.width = PREVIEW_W;
 typoWork.height = PREVIEW_H;
+// drawTypoAdaptiveは内部でdestCtxにも描くが、フェードインの不透明度は
+// vctxへ貼る側で別途制御したいので、ここでは使い捨ての描画先として渡す
+const typoDummyDest = document.createElement('canvas');
+typoDummyDest.width = PREVIEW_W;
+typoDummyDest.height = PREVIEW_H;
+const typoDummyCtx = typoDummyDest.getContext('2d');
 
 for (const [id, src] of Object.entries(OBJECT_SRC)) {
   const img = new Image();
@@ -413,6 +419,11 @@ function pickStroke(p) {
 let replayQueue = null; // 再生待ちのストローク列(先頭から順に演出)
 const FADE_OUT_MS = 450; // 開始時、今の見た目が消えるまでのフェード時間
 let fadeOut = null; // { canvas, start } 消える瞬間の見た目を焼き付けたスナップショット
+// true の間にフェードアウトが完了すると、その瞬間に背景レイヤーを切り替える
+// (ストロークが完全に消えるのと同じタイミングで背景も切り替わるようにするため)
+let typoSwapPending = false;
+const TYPO_FADE_IN_MS = 450; // 次の背景レイヤーがフェードインする時間(FADE_OUT_MSと揃える)
+let typoFadeIn = null; // { start } 背景切り替え直後、透明度0からのフェードイン管理
 
 function startReplayShow() {
   if (!state.strokes.length) return;
@@ -435,6 +446,7 @@ function startReplayShow() {
 // 描画操作や削除が入ったら演出は中断し、完成状態に戻す
 function cancelReplayShow() {
   fadeOut = null;
+  typoSwapPending = false;
   if (sequence) {
     stopSequencePlayback();
     return;
@@ -451,9 +463,11 @@ const SEQUENCE_HOLD_MS = 2000; // 1件描き終えてから、次のフェード
 let sequence = null; // { savedStrokes, index, holding, holdUntil }
 
 function playSequenceTake(index) {
-  randomizeTypoVersion(); // 背景レイヤーは前の作品と被らないようランダムに切り替える
   state.strokes = cloneStrokes(state.takes[index].strokes);
   startReplayShow();
+  // 背景の切り替えはここでは行わず、フェードアウトが完全に終わった瞬間まで待つ
+  // (ストロークが消えるのと背景が変わるタイミングを合わせるため)
+  typoSwapPending = true;
 }
 
 function startSequencePlayback() {
@@ -469,6 +483,7 @@ function stopSequencePlayback() {
   sequence = null;
   replayQueue = null;
   fadeOut = null;
+  typoSwapPending = false;
   anims.length = 0;
   captionAnims.length = 0;
   state.selected = null;
@@ -651,8 +666,22 @@ function frameBody(now) {
     // artが変化したフレームだけ明暗合成(フィルタ処理)をやり直し、
     // 変化がない間は前フレームのtypoWorkをそのまま貼るだけにして負荷を下げる
     if (artDirty) {
-      drawTypoAdaptive(vctx, art, state.typoPreview, PREVIEW_W, PREVIEW_H, typoWork);
+      drawTypoAdaptive(typoDummyCtx, art, state.typoPreview, PREVIEW_W, PREVIEW_H, typoWork);
       artDirty = false;
+    }
+    // 背景切り替え直後はここでフェードイン(透明度0→1)させる。
+    // ストロークの描き始めと同じ瞬間にtypoFadeInがセットされるので、自然と同期する
+    if (typoFadeIn) {
+      const ft = (now - typoFadeIn.start) / TYPO_FADE_IN_MS;
+      if (ft >= 1) {
+        typoFadeIn = null;
+        vctx.drawImage(typoWork, 0, 0);
+      } else {
+        vctx.save();
+        vctx.globalAlpha = Math.max(0, ft);
+        vctx.drawImage(typoWork, 0, 0);
+        vctx.restore();
+      }
     } else {
       vctx.drawImage(typoWork, 0, 0);
     }
@@ -748,6 +777,11 @@ function frameBody(now) {
     const t = (now - fadeOut.start) / FADE_OUT_MS;
     if (t >= 1) {
       fadeOut = null;
+      if (typoSwapPending) {
+        // 前の作品が完全に消えた瞬間に合わせて背景レイヤーを切り替える
+        typoSwapPending = false;
+        randomizeTypoVersion();
+      }
     } else {
       vctx.save();
       vctx.globalAlpha = 1 - t;
@@ -803,9 +837,20 @@ function pickImage(onload) {
   input.click();
 }
 
+// 一度読み込んだタイポ画像はキャッシュし、2回目以降の切り替えは待たずに即反映する
+// (Enter/Qキーでの背景切り替えを、ストロークが消えるタイミングとぴったり合わせるため)
+const typoImageCache = {};
+
 function loadTypo(src, retriesLeft = 2) {
+  const cached = typoImageCache[src];
+  if (cached) {
+    state.typo = cached;
+    cacheTypoPreview();
+    return;
+  }
   const img = new Image();
   img.onload = () => {
+    typoImageCache[src] = img;
     state.typo = img;
     cacheTypoPreview();
   };
@@ -820,6 +865,19 @@ function loadTypo(src, retriesLeft = 2) {
   img.src = src;
 }
 
+// 起動時に全タイポ版をキャッシュしておく(表示中のものは変えない)。
+// これでEnter/Qキーでのランダム切り替えは初回選択時から即座に反映される
+function preloadAllTypoVersions() {
+  for (const src of Object.values(TYPO_SRC)) {
+    if (typoImageCache[src]) continue;
+    const img = new Image();
+    img.onload = () => {
+      typoImageCache[src] = img;
+    };
+    img.src = src;
+  }
+}
+
 // 背景レイヤー(タイポ版)を、直前と被らないようにランダムに切り替える
 function randomizeTypoVersion() {
   const keys = Object.keys(TYPO_SRC);
@@ -828,6 +886,9 @@ function randomizeTypoVersion() {
   params.typoVersion = next;
   loadTypo(TYPO_SRC[next]);
   pane.refresh();
+  // 新しい背景は透明度0から出現させる。ストロークの描き始めと同じ瞬間に始まるよう、
+  // ここ(切り替えの瞬間)でフェードインを開始する
+  typoFadeIn = { start: performance.now() };
 }
 
 // ---- リセット ----
@@ -851,8 +912,10 @@ function registerTake() {
   state.takes.push({ id: Date.now(), strokes: cloneStrokes(state.strokes) });
   saveTakesToStorage();
   console.log(`作品を登録しました(全${state.takes.length}件)`);
-  randomizeTypoVersion();
+  // ストロークが消えるのと同じタイミングで背景も切り替わるよう、リセットの直後に呼ぶ
+  // (画像キャッシュ済みのタイポ版なら同期的に切り替わる)
   resetCanvas();
+  randomizeTypoVersion();
 }
 
 // ---- 表示モード(F: フルスクリーン / H: UIの表示切替) ----
@@ -1336,6 +1399,7 @@ syncBrushUI();
 // ---- 起動 ----
 resetBase(art);
 loadTypo(TYPO_SRC[params.typoVersion]);
+preloadAllTypoVersions();
 loadTakesFromStorage();
 frame();
 

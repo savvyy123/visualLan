@@ -911,6 +911,7 @@ function registerTake() {
   if (sequence || !state.strokes.length) return;
   state.takes.push({ id: Date.now(), strokes: cloneStrokes(state.strokes) });
   saveTakesToStorage();
+  rebuildTakesUI();
   console.log(`作品を登録しました(全${state.takes.length}件)`);
   // ストロークが消えるのと同じタイミングで背景も切り替わるよう、リセットの直後に呼ぶ
   // (画像キャッシュ済みのタイポ版なら同期的に切り替わる)
@@ -1345,6 +1346,29 @@ const animFolder = pane.addFolder({ title: 'アニメーション (Aキーで全
 animFolder.addBinding(params, 'animDelay', { label: '遅延(秒)', min: 0, max: 3, step: 0.1 });
 animFolder.addBinding(params, 'animDuration', { label: '描画時間(秒)', min: 0.1, max: 5, step: 0.1 });
 
+// -- 6.5 登録作品(Enterで登録/Qキーで連続再生)の管理 --
+const takesFolder = pane.addFolder({ title: '登録作品(Enter/Q)', expanded: false });
+const clearTakesBtn = takesFolder.addButton({ title: '全て削除' });
+clearTakesBtn.on('click', () => {
+  if (!state.takes.length) return;
+  state.takes.length = 0;
+  saveTakesToStorage();
+  rebuildTakesUI();
+});
+let takeRowBlades = [];
+function rebuildTakesUI() {
+  for (const blade of takeRowBlades) takesFolder.remove(blade);
+  takeRowBlades = state.takes.map((take, i) => {
+    const row = takesFolder.addButton({ title: '削除', label: `作品 ${i + 1}`, index: i });
+    row.on('click', () => {
+      state.takes.splice(i, 1);
+      saveTakesToStorage();
+      rebuildTakesUI();
+    });
+    return row;
+  });
+}
+
 // -- 7. 編集/書き出し --
 pane.addButton({ title: 'Undo (⌘Z)' }).on('click', undo);
 pane.addButton({ title: '選択を削除 (Delete)' }).on('click', deleteSelected);
@@ -1401,6 +1425,7 @@ resetBase(art);
 loadTypo(TYPO_SRC[params.typoVersion]);
 preloadAllTypoVersions();
 loadTakesFromStorage();
+rebuildTakesUI();
 frame();
 
 // デバッグ/外部連携用(TD連携時にも使う想定)

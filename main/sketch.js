@@ -447,7 +447,7 @@ function cancelReplayShow() {
 }
 
 // ---- 連続再生(Qキー): 登録済みの作品(takes)を1件ずつフェード→再生し、最後まで行ったらループする ----
-const SEQUENCE_HOLD_MS = 1800; // 1件描き終えてから、次のフェードアウトに移るまでの静止時間
+const SEQUENCE_HOLD_MS = 2000; // 1件描き終えてから、次のフェードアウトに移るまでの静止時間
 let sequence = null; // { savedStrokes, index, holding, holdUntil }
 
 function playSequenceTake(index) {

@@ -1,7 +1,7 @@
 import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
 import JSZip from 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
 import { drawCover, replayStroke, createEngines, buildCaptionTrack } from './brush.js';
-import { startHandTracking, stopHandTracking, handCursors, HAND_POINTER_ID } from './hand.js';
+import { startHandTracking, stopHandTracking, handCursors, HAND_POINTER_ID, handFilterParams, handRangeParams } from './hand.js';
 import { initCropTool } from './crop.js';
 import { makeDraggable } from './drag.js';
 
@@ -184,7 +184,6 @@ barcodeFont.load().then((f) => document.fonts.add(f));
 const params = {
   brushType: 'stamp',
   stampImage: 'tomatoes',
-  stampTexture: false,
   stampTextureColor: 'native',
   stampColor: '#000000',
   stampSize: 150,
@@ -192,7 +191,7 @@ const params = {
   rotate: true,
   animDelay: 0.4,
   animDuration: 0.7,
-  barcodeText: 'IDC VISUAL LAN',
+  barcodeText: 'IDC',
   barcodeSize: 120,
   barcodeColor: '#000000',
   effectType: 'stretch',
@@ -210,7 +209,7 @@ const params = {
   typoVersion: 'ver6',
   handTracking: false,
   rightHandBrush: 'stamp',
-  leftHandBrush: 'stampTex',
+  leftHandBrush: 'barcode',
   dpi: 150,
 };
 
@@ -312,7 +311,7 @@ function makeStroke(kind) {
   const isTdStamp = imageId.startsWith('td');
   if (isTdStamp) {
     imageId = tintedImageId(imageId, params.stampColor);
-  } else if (kind === 'stampTex' || params.stampTexture) {
+  } else if (kind === 'stampTex') {
     imageId = texturedImageId(imageId, params.stampTextureColor);
   }
   return {
@@ -516,6 +515,14 @@ function deleteSelected() {
   state.selected = null;
 }
 
+// ハンドトラッキング中、スタンプ系のストロークを始めるたびにランダムで選ぶ画像の候補。
+// 食材アイコンのみが対象(TDの抽象スタンプ/カスタムスタンプは対象外)
+const HAND_STAMP_IMAGE_POOL = Object.keys(OBJECT_SRC).filter((id) => !id.startsWith('td'));
+
+function pickRandomStampImage() {
+  return HAND_STAMP_IMAGE_POOL[Math.floor(Math.random() * HAND_STAMP_IMAGE_POOL.length)];
+}
+
 view.addEventListener('pointerdown', (e) => {
   try { view.setPointerCapture(e.pointerId); } catch { /* 合成イベント等では不可 */ }
   cancelReplayShow();
@@ -530,6 +537,11 @@ view.addEventListener('pointerdown', (e) => {
   const kind = hand
     ? (hand === 'right' ? params.rightHandBrush : params.leftHandBrush)
     : params.brushType;
+  // 手で描くスタンプ系ブラシは、ストロークを始めるたびに画像をランダムに切り替える
+  if (hand && (kind === 'stamp' || kind === 'stampTex')) {
+    params.stampImage = pickRandomStampImage();
+    pane.refresh();
+  }
   const stroke = makeStroke(kind);
   stroke.points.push(pointFromEvent(e));
   liveStrokes.set(e.pointerId, stroke);
@@ -1204,10 +1216,10 @@ uiStampColorPreset.on('change', (ev) => {
   params.stampColor = ev.value;
   pane.refresh();
 });
-// オブジェクト画像選択時だけ表示
-const uiStampTexture = stampFolder.addBinding(params, 'stampTexture', { label: 'TDノイズ質感' });
+// オブジェクト画像選択時だけ表示。TDノイズ質感は左手ブラシ「スタンプ(TDノイズ質感)」専用の
+// 見た目になったので、ここでは色だけ選べるようにする(質感そのもののON/OFFチェックボックスは廃止)
 const uiStampTextureColor = stampFolder.addBinding(params, 'stampTextureColor', {
-  label: '質感の色',
+  label: '質感の色(左手テクスチャ用)',
   options: { '固有色': 'native', '黒': 'black', '白': 'white' },
 });
 
@@ -1327,6 +1339,26 @@ const HAND_BRUSH_OPTIONS = {
 };
 handFolder.addBinding(params, 'rightHandBrush', { label: '右手ブラシ', options: HAND_BRUSH_OPTIONS });
 handFolder.addBinding(params, 'leftHandBrush', { label: '左手ブラシ', options: HAND_BRUSH_OPTIONS });
+// カーソルの手ぶれ除去(1ユーロフィルタ)。値はhand.js側でリアルタイムに参照される
+handFolder.addBinding(handFilterParams, 'minCutoff', {
+  label: '手ぶれ除去(静止時)',
+  min: 0.005,
+  max: 0.5,
+  step: 0.005,
+});
+handFolder.addBinding(handFilterParams, 'beta', {
+  label: '動き追従の速さ',
+  min: 0,
+  max: 20,
+  step: 0.5,
+});
+// 画面中心まわりの可動域ゲイン。大きいほど、手を大きく動かさなくても端まで届く
+handFolder.addBinding(handRangeParams, 'gain', {
+  label: '可動域(端まで届きやすさ)',
+  min: 1,
+  max: 3,
+  step: 0.05,
+});
 handToggle.on('change', async (ev) => {
   if (ev.value) {
     try {
@@ -1410,7 +1442,6 @@ function syncBrushUI() {
   const isTd = params.stampImage.startsWith('td');
   uiStampColor.hidden = !isTd;
   uiStampColorPreset.hidden = !isTd;
-  uiStampTexture.hidden = isTd;
   uiStampTextureColor.hidden = isTd;
   uiRotate.hidden = !isTd; // 回転の選択はTD系スタンプのみ(画像=オフ固定/バーコード=オン固定)
   uiEffectWidth.hidden = params.effectType === 'none';

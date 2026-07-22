@@ -13,7 +13,61 @@ const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmark
 // ヒステリシスでチャタリングを防ぐ
 const PINCH_ON = 0.32;
 const PINCH_OFF = 0.45;
-const CURSOR_SMOOTH = 0.45; // カーソルEMA係数(大きいほど機敏)
+// ピンチ比が瞬間的にPINCH_OFFを超えても、すぐには離した扱いにしない。
+// 手の向きが変わった一瞬だけ数値が揺れて線が途切れるのを防ぐ
+const PINCH_RELEASE_GRACE_MS = 120;
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, v));
+}
+
+// ---- 1ユーロフィルタ ----
+// 止まっている時は強めに滑らかにして手ぶれ(検出ノイズ)を消し、
+// 素早く動いた瞬間は自動で滑らかさを弱めて遅れが出ないようにする適応フィルタ。
+// 固定係数のEMAだと「静止時のブレを消す」と「動いた時に遅れない」を両立できないため採用
+class OneEuroFilter {
+  constructor() {
+    this.xPrev = null;
+    this.dxPrev = 0;
+    this.tPrev = null;
+  }
+  reset() {
+    this.xPrev = null;
+    this.dxPrev = 0;
+    this.tPrev = null;
+  }
+  static alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+  filter(x, t, minCutoff, beta, dCutoff = 1) {
+    if (this.tPrev === null) {
+      this.xPrev = x;
+      this.tPrev = t;
+      return x;
+    }
+    const dt = Math.max(1e-3, t - this.tPrev);
+    const dx = (x - this.xPrev) / dt;
+    const aD = OneEuroFilter.alpha(dCutoff, dt);
+    const dxHat = this.dxPrev + aD * (dx - this.dxPrev);
+    const cutoff = minCutoff + beta * Math.abs(dxHat);
+    const a = OneEuroFilter.alpha(cutoff, dt);
+    const xHat = this.xPrev + a * (x - this.xPrev);
+    this.xPrev = xHat;
+    this.dxPrev = dxHat;
+    this.tPrev = t;
+    return xHat;
+  }
+}
+
+// Tweakpaneから調整する想定のフィルタ強度。
+// minCutoff: 大きいほど、止まっている時の細かい震えが早く消える(その分、動き出しの追従が少し重くなる)
+// beta: 大きいほど、素早く動いた時に遅れが出にくくなる(その分、静止直後は少し敏感になりやすい)
+export const handFilterParams = { minCutoff: 0.08, beta: 3 };
+
+// 手の可動域をキャンバス全体に引き伸ばすための倍率。カメラに映る範囲全体を
+// 動かさなくても、中心(0.5,0.5)まわりの少しの動きでキャンバス端まで届くようにする
+export const handRangeParams = { gain: 1.6 };
 
 // 手ごとの合成ポインタID(sketch.js側でどちらの手か判別するのに使う)
 export const HAND_POINTER_ID = { left: 998, right: 999 };
@@ -25,10 +79,22 @@ let rafId = 0;
 let running = false;
 let lastVideoTime = -1;
 
+// 検出が1フレームだけ途切れても、すぐに手を見失った扱い(=ストロークを打ち切り)には
+// せず、この時間だけは「まだ描いている」として粘る。検出のちらつきで線が途中で
+// 切れてしまうのを防ぐため
+const LOSE_GRACE_MS = 250;
+const lastSeenAt = { left: -Infinity, right: -Infinity };
+
 // フレームループから参照する両手のカーソル状態(正規化キャンバス座標)
 const cursors = {
-  left: { x: 0.5, y: 0.5, active: false, drawing: false },
-  right: { x: 0.5, y: 0.5, active: false, drawing: false },
+  left: {
+    x: 0.5, y: 0.5, active: false, drawing: false,
+    fx: new OneEuroFilter(), fy: new OneEuroFilter(), pinchAboveOffSince: null,
+  },
+  right: {
+    x: 0.5, y: 0.5, active: false, drawing: false,
+    fx: new OneEuroFilter(), fy: new OneEuroFilter(), pinchAboveOffSince: null,
+  },
 };
 
 export function handCursors() {
@@ -55,24 +121,35 @@ function updateHand(view, hand, lm) {
   // 鏡像(セルフィー)にして、指の動きと画面の動きを一致させる
   const rawX = 1 - lm[8].x;
   const rawY = lm[8].y;
-  if (!c.active) {
-    c.x = rawX;
-    c.y = rawY;
-  } else {
-    c.x += (rawX - c.x) * CURSOR_SMOOTH;
-    c.y += (rawY - c.y) * CURSOR_SMOOTH;
-  }
+  const now = performance.now();
+  const t = now / 1000; // 1ユーロフィルタはHz(秒)基準の係数を使うため
+  const fx = c.fx.filter(rawX, t, handFilterParams.minCutoff, handFilterParams.beta);
+  const fy = c.fy.filter(rawY, t, handFilterParams.minCutoff, handFilterParams.beta);
+  // 中心(0.5, 0.5)まわりにゲインをかけ、カメラ全体を動かさなくても
+  // キャンバス端まで届くようにする
+  const g = handRangeParams.gain;
+  c.x = clamp01(0.5 + (fx - 0.5) * g);
+  c.y = clamp01(0.5 + (fy - 0.5) * g);
   c.active = true;
 
   const pinch = dist(lm[4], lm[8]) / Math.max(1e-6, dist(lm[0], lm[9]));
   if (!c.drawing && pinch < PINCH_ON) {
     c.drawing = true;
+    c.pinchAboveOffSince = null;
     dispatchPointer(view, 'pointerdown', hand);
   } else if (c.drawing) {
     if (pinch > PINCH_OFF) {
-      c.drawing = false;
-      dispatchPointer(view, 'pointerup', hand);
+      // 一瞬だけ閾値を超えても即終了にはせず、猶予時間だけ様子を見る
+      if (c.pinchAboveOffSince === null) c.pinchAboveOffSince = now;
+      if (now - c.pinchAboveOffSince > PINCH_RELEASE_GRACE_MS) {
+        c.drawing = false;
+        c.pinchAboveOffSince = null;
+        dispatchPointer(view, 'pointerup', hand);
+      } else {
+        dispatchPointer(view, 'pointermove', hand);
+      }
     } else {
+      c.pinchAboveOffSince = null;
       dispatchPointer(view, 'pointermove', hand);
     }
   }
@@ -86,6 +163,10 @@ function loseHand(view, hand) {
     dispatchPointer(view, 'pointerup', hand);
   }
   c.active = false;
+  c.pinchAboveOffSince = null;
+  // 次に検出した瞬間、古い時刻からの差分で暴れないようフィルタをリセットしておく
+  c.fx.reset();
+  c.fy.reset();
 }
 
 export async function startHandTracking(view) {
@@ -124,6 +205,7 @@ export async function startHandTracking(view) {
     lastVideoTime = video.currentTime;
     const res = landmarker.detectForVideo(video, performance.now());
     const seen = { left: false, right: false };
+    const now = performance.now();
     if (res.landmarks) {
       for (let i = 0; i < res.landmarks.length; i++) {
         // handednessはセルフィー(鏡像)前提のラベルなので、そのままユーザーの左右に対応する
@@ -131,11 +213,14 @@ export async function startHandTracking(view) {
         const hand = label === 'Left' ? 'left' : 'right';
         if (seen[hand]) continue; // 同ラベルが2つ出たら先勝ち
         seen[hand] = true;
+        lastSeenAt[hand] = now;
         updateHand(view, hand, res.landmarks[i]);
       }
     }
     for (const hand of ['left', 'right']) {
-      if (!seen[hand]) loseHand(view, hand);
+      if (!seen[hand] && now - lastSeenAt[hand] > LOSE_GRACE_MS) {
+        loseHand(view, hand);
+      }
     }
   };
   loop();
@@ -144,7 +229,10 @@ export async function startHandTracking(view) {
 export function stopHandTracking(view) {
   running = false;
   cancelAnimationFrame(rafId);
-  for (const hand of ['left', 'right']) loseHand(view, hand);
+  for (const hand of ['left', 'right']) {
+    loseHand(view, hand);
+    lastSeenAt[hand] = -Infinity;
+  }
   if (stream) {
     for (const t of stream.getTracks()) t.stop();
     stream = null;

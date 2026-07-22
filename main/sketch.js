@@ -209,6 +209,7 @@ const params = {
   typoVersion: 'ver6',
   handTracking: false,
   handBrush: 'stamp', // 左右の区別なし。どちらの手でも同じブラシで描く
+  strokeLimit: 4, // この本数描いたら自動登録して白紙に戻す
   idleAutoPlaySec: 12, // 手が誰もいない状態がこの秒数続いたら自動でQモード(連続再生)に入る
   dpi: 150,
 };
@@ -414,8 +415,8 @@ function pickStroke(p) {
 }
 
 // ---- 自動登録(ストローク数の上限) ----
-// ライブ描画がこの本数に達したら、Enterキーと同じ動作(登録して白紙に戻す)を自動で行う
-const STROKE_LIMIT = 4;
+// ライブ描画がこの本数に達したら、Enterキーと同じ動作(登録して白紙に戻す)を自動で行う。
+// 上限値自体はparams.strokeLimitとしてTweakpaneから選べるようにする
 let pendingAutoRegister = false; // 上限に達した直後、直前のアニメーションが全部描き終わるのを待つフラグ
 
 // ---- リプレイ演出 ----
@@ -586,7 +587,7 @@ view.addEventListener('pointerup', (e) => {
     if (stroke.points.length >= min) {
       state.strokes.push(stroke);
       anims.push(makeAnim(stroke));
-      if (state.strokes.length >= STROKE_LIMIT) pendingAutoRegister = true;
+      if (state.strokes.length >= params.strokeLimit) pendingAutoRegister = true;
     }
   }
 });
@@ -1386,6 +1387,11 @@ handFolder.addBinding(handRangeParams, 'gain', {
   min: 1,
   max: 3,
   step: 0.05,
+});
+// この本数描いたら自動登録して白紙に戻す(選択式)
+handFolder.addBinding(params, 'strokeLimit', {
+  label: '自動登録までの本数',
+  options: { '2本': 2, '3本': 3, '4本': 4, '5本': 5, '6本': 6, '8本': 8, '10本': 10 },
 });
 // 手が誰もいない状態が続いた時、自動でQモード(連続再生)に切り替わるまでの秒数
 handFolder.addBinding(params, 'idleAutoPlaySec', {

@@ -208,8 +208,8 @@ const params = {
   typoVisible: true,
   typoVersion: 'ver6',
   handTracking: false,
-  rightHandBrush: 'stamp',
-  leftHandBrush: 'barcode',
+  handBrush: 'stamp', // 左右の区別なし。どちらの手でも同じブラシで描く
+  idleAutoPlaySec: 12, // 手が誰もいない状態がこの秒数続いたら自動でQモード(連続再生)に入る
   dpi: 150,
 };
 
@@ -413,6 +413,11 @@ function pickStroke(p) {
   return null;
 }
 
+// ---- 自動登録(ストローク数の上限) ----
+// ライブ描画がこの本数に達したら、Enterキーと同じ動作(登録して白紙に戻す)を自動で行う
+const STROKE_LIMIT = 4;
+let pendingAutoRegister = false; // 上限に達した直後、直前のアニメーションが全部描き終わるのを待つフラグ
+
 // ---- リプレイ演出 ----
 // Aキーで、描いた軌跡を白紙から順番にアニメーション再生する
 let replayQueue = null; // 再生待ちのストローク列(先頭から順に演出)
@@ -460,6 +465,8 @@ function cancelReplayShow() {
 // ---- 連続再生(Qキー): 登録済みの作品(takes)を1件ずつフェード→再生し、最後まで行ったらループする ----
 const SEQUENCE_HOLD_MS = 2000; // 1件描き終えてから、次のフェードアウトに移るまでの静止時間
 let sequence = null; // { savedStrokes, index, holding, holdUntil }
+// 手が誰も検出されていない時間の起点(手トラッキング時、idleAutoPlaySec秒続いたら自動でQモードに入る)
+let lastHandActiveAt = performance.now();
 
 function playSequenceTake(index) {
   state.strokes = cloneStrokes(state.takes[index].strokes);
@@ -534,9 +541,7 @@ view.addEventListener('pointerdown', (e) => {
     dragSel = state.selected ? { last: p, dx: 0, dy: 0 } : null;
     return;
   }
-  const kind = hand
-    ? (hand === 'right' ? params.rightHandBrush : params.leftHandBrush)
-    : params.brushType;
+  const kind = hand ? params.handBrush : params.brushType;
   // 手で描くスタンプ系ブラシは、ストロークを始めるたびに画像をランダムに切り替える
   if (hand && (kind === 'stamp' || kind === 'stampTex')) {
     params.stampImage = pickRandomStampImage();
@@ -581,6 +586,7 @@ view.addEventListener('pointerup', (e) => {
     if (stroke.points.length >= min) {
       state.strokes.push(stroke);
       anims.push(makeAnim(stroke));
+      if (state.strokes.length >= STROKE_LIMIT) pendingAutoRegister = true;
     }
   }
 });
@@ -672,6 +678,24 @@ function frameBody(now) {
   if (sequence && sequence.holding && now >= sequence.holdUntil) {
     sequence.holding = false;
     advanceSequence();
+  }
+  // ストローク数の上限に達していたら、直前のアニメーションが全部片付いたところで
+  // Enterキーと同じ自動登録を行う(連続再生/リプレイ演出中は行わない)
+  if (pendingAutoRegister && !anims.length && !replayQueue && !sequence) {
+    pendingAutoRegister = false;
+    registerTake();
+  }
+  // 手が誰もいない時間が続いたら自動でQモード(連続再生)に入り、
+  // 手を感知したら即座に抜けて描けるようにする(手トラッキング使用時のみ)
+  if (params.handTracking) {
+    const hcs = handCursors();
+    const anyHandActive = hcs.left.active || hcs.right.active;
+    if (anyHandActive) {
+      lastHandActiveAt = now;
+      if (sequence) stopSequencePlayback();
+    } else if (!sequence && state.takes.length && now - lastHandActiveAt > params.idleAutoPlaySec * 1000) {
+      startSequencePlayback();
+    }
   }
   vctx.drawImage(art, 0, 0);
   if (params.typoVisible && state.typoPreview) {
@@ -906,6 +930,7 @@ function randomizeTypoVersion() {
 // ---- リセット ----
 // Rキーで、描いたストロークを全部消して白紙(写真レイヤーのみ)に戻す
 function resetCanvas() {
+  pendingAutoRegister = false;
   if (!state.strokes.length) return;
   replayQueue = null;
   fadeOut = null;
@@ -919,9 +944,13 @@ function resetCanvas() {
 // ---- 作品登録(Enterキー) ----
 // 今キャンバスにある全ストロークを1作品としてtakesに登録し、localStorageに保存。
 // 登録後は次の作品をすぐ描き始められるよう白紙に戻す
+const MAX_TAKES = 15; // ヒストリーの最大件数。これを超えたら古いものから捨てる
+
 function registerTake() {
   if (sequence || !state.strokes.length) return;
-  state.takes.push({ id: Date.now(), strokes: cloneStrokes(state.strokes) });
+  // 新しいものほど先頭に来るようにする。上限を超えたら古い(末尾の)ものから捨てる
+  state.takes.unshift({ id: Date.now(), strokes: cloneStrokes(state.strokes) });
+  if (state.takes.length > MAX_TAKES) state.takes.length = MAX_TAKES;
   saveTakesToStorage();
   rebuildTakesUI();
   console.log(`作品を登録しました(全${state.takes.length}件)`);
@@ -1337,8 +1366,7 @@ const HAND_BRUSH_OPTIONS = {
   'バーコード': 'barcode',
   'ストレッチ(背景)': 'stretch',
 };
-handFolder.addBinding(params, 'rightHandBrush', { label: '右手ブラシ', options: HAND_BRUSH_OPTIONS });
-handFolder.addBinding(params, 'leftHandBrush', { label: '左手ブラシ', options: HAND_BRUSH_OPTIONS });
+handFolder.addBinding(params, 'handBrush', { label: '手ブラシ(左右共通)', options: HAND_BRUSH_OPTIONS });
 // カーソルの手ぶれ除去(1ユーロフィルタ)。値はhand.js側でリアルタイムに参照される
 handFolder.addBinding(handFilterParams, 'minCutoff', {
   label: '手ぶれ除去(静止時)',
@@ -1358,6 +1386,13 @@ handFolder.addBinding(handRangeParams, 'gain', {
   min: 1,
   max: 3,
   step: 0.05,
+});
+// 手が誰もいない状態が続いた時、自動でQモード(連続再生)に切り替わるまでの秒数
+handFolder.addBinding(params, 'idleAutoPlaySec', {
+  label: '自動再生までの秒数',
+  min: 3,
+  max: 60,
+  step: 1,
 });
 handToggle.on('change', async (ev) => {
   if (ev.value) {

@@ -1391,7 +1391,10 @@ handFolder.addBinding(handRangeParams, 'gain', {
 // この本数描いたら自動登録して白紙に戻す(選択式)
 handFolder.addBinding(params, 'strokeLimit', {
   label: '自動登録までの本数',
-  options: { '2本': 2, '3本': 3, '4本': 4, '5本': 5, '6本': 6, '8本': 8, '10本': 10 },
+  options: {
+    '2本': 2, '3本': 3, '4本': 4, '5本': 5, '6本': 6, '8本': 8, '10本': 10,
+    '無制限(自動でリセットしない)': Infinity,
+  },
 });
 // 手が誰もいない状態が続いた時、自動でQモード(連続再生)に切り替わるまでの秒数
 handFolder.addBinding(params, 'idleAutoPlaySec', {
